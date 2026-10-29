@@ -1,0 +1,9 @@
+# Clave de firma de Android: NUNCA se sube (guárdala tú aparte)
+*.keystore
+*.jks
+# Archivos generados
+out/
+*.apk
+*.idsig
+.DS_Store
+.claude/
