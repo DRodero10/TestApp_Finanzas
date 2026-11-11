@@ -8,7 +8,7 @@
 
 // Sube SCHEMA y añade un paso en migrate() cada vez que cambie la forma de los datos.
 const SCHEMA = 4;
-const APP_VERSION = '1.3';
+const APP_VERSION = '1.4';
 
 const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 const MES_C = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
@@ -26,17 +26,36 @@ const C_OUT = '#d95926';  // serie "Gastos" en el gráfico anual
 const CAR_KINDS = {
   gasolina:   { name: 'Gasolina',   icon: '⛽', sign: -1, help: 'Lo que echas al coche. Se resta de la hucha y no cuenta como gasto del mes.' },
   blablacar:  { name: 'BlaBlaCar',  icon: '🚗', sign: 1,  help: 'Lo que te pagan los pasajeros. Se suma a la hucha y no cuenta como ingreso del mes.' },
-  aportacion: { name: 'Aportación', icon: '💶', sign: 1,  help: 'Dinero tuyo que metes en la cuenta del coche. Se suma a la hucha y cuenta como gasto de Transporte del mes.' },
+  aportacion: { name: 'Aportación', icon: '💶', sign: 1,  help: 'Dinero tuyo que metes en la cuenta del coche. Se suma a la hucha.' },
 };
 
 const SAV_KINDS = {
-  deposito: { name: 'Meter', icon: '➕', sign: 1,  help: 'Dinero que pasas a la cuenta de ahorros. Se suma al saldo y no cuenta como gasto del mes.' },
+  deposito: { name: 'Meter', icon: '➕', sign: 1,  help: 'Dinero que pasas a la cuenta de ahorros. Se suma al saldo.' },
   retirada: { name: 'Sacar', icon: '➖', sign: -1, help: 'Dinero que sacas de los ahorros, por ejemplo para comprar algo. Se resta del saldo y no cuenta en tus gastos del mes.' },
 };
+/**
+ * De dónde sale el dinero que entra en una cuenta aparte (campo `src` del movimiento).
+ * - Aportación a la hucha del coche: de la nómina (gasto de Transporte del mes) o de ahorros (se resta de ahorros).
+ * - Dinero metido en ahorros: de la nómina (se resta de lo que te queda del mes) o de fuera (no cuenta en el mes).
+ * Los movimientos antiguos no tienen `src` y conservan cómo se contaban antes.
+ */
+const SOURCES = {
+  aportacion: {
+    nomina:  { name: 'De la nómina', help: 'Cuenta como gasto de Transporte del mes.' },
+    ahorros: { name: 'De ahorros', help: 'Se resta de tu cuenta de ahorros y no cuenta como gasto del mes.' },
+  },
+  deposito: {
+    nomina: { name: 'De la nómina', help: 'Se resta de lo que te queda este mes.' },
+    fuera:  { name: 'De otro sitio', help: 'No cuenta en el mes (p. ej. un regalo o los intereses del banco).' },
+  },
+};
+const carSrc = m => m.src || 'nomina';
+const savSrc = m => m.src || 'fuera';
+
 /** Las dos cuentas aparte (hucha del coche y ahorros) comparten formulario; esto dice cuál es cuál. */
 const FUNDS = {
-  car: { kinds: CAR_KINDS, store: () => S.car, title: 'Hucha del coche', placeholder: 'p. ej. Madrid – Valencia' },
-  sav: { kinds: SAV_KINDS, store: () => S.savings, title: 'Ahorros', placeholder: 'p. ej. Portátil nuevo' },
+  car: { kinds: CAR_KINDS, store: () => S.car, movs: () => S.car.movements, title: 'Hucha del coche', placeholder: 'p. ej. Madrid – Valencia' },
+  sav: { kinds: SAV_KINDS, store: () => S.savings, movs: () => savMovs(), title: 'Ahorros', placeholder: 'p. ej. Portátil nuevo' },
 };
 
 function defaults() {
@@ -230,35 +249,49 @@ function periodSub(mk) {
   return natural ? '' : shortDate(r.from) + ' – ' + shortDate(r.to);
 }
 
-/** Gastos del periodo, incluidas las aportaciones a la hucha del coche (cuentan como Transporte). */
+/** Gastos del periodo, incluidas las aportaciones a la hucha del coche pagadas con la nómina (cuentan como Transporte). */
 function expenses(prefix) {
   const inP = inPeriod(prefix);
   const own = S.movements.filter(m => m.type === 'gasto' && inP(m));
-  const car = S.car.movements.filter(m => m.kind === 'aportacion' && inP(m)).map(m => ({
+  const car = S.car.movements.filter(m => m.kind === 'aportacion' && carSrc(m) === 'nomina' && inP(m)).map(m => ({
     id: m.id, type: 'gasto', category: 'transporte', amount: m.amount, date: m.date, created: m.created,
     note: 'Aportación hucha coche' + (m.note ? ' · ' + m.note : ''), car: true,
   }));
   return own.concat(car);
 }
 function incomes(prefix) { const inP = inPeriod(prefix); return S.movements.filter(m => m.type === 'ingreso' && inP(m)); }
+/** Dinero pasado de la nómina a ahorros en el periodo: no es gasto, pero se resta de lo que te queda. */
+function toSavings(prefix) {
+  const inP = inPeriod(prefix);
+  return S.savings.movements.filter(m => m.kind === 'deposito' && savSrc(m) === 'nomina' && inP(m)).map(m => ({
+    id: m.id, type: 'ahorro', amount: m.amount, date: m.date, created: m.created, note: m.note, sav: true,
+  }));
+}
 
 function carMovs(prefix) { return S.car.movements.filter(inPeriod(prefix)); }
 function carStats(prefix) {
   const ms = carMovs(prefix), g = k => sum(ms.filter(m => m.kind === k));
   const gas = g('gasolina'), bla = g('blablacar');
-  return { gas, bla, apo: g('aportacion'), net: gas - bla };
+  const apo = ms.filter(m => m.kind === 'aportacion'), apoSav = sum(apo.filter(m => carSrc(m) === 'ahorros'));
+  return { gas, bla, apo: sum(apo), apoNom: sum(apo) - apoSav, apoSav, net: gas - bla };
+}
+/** Movimientos de ahorros, más las aportaciones a la hucha del coche pagadas con ahorros (como retiradas). */
+function savMovs() {
+  return S.savings.movements.concat(S.car.movements.filter(m => m.kind === 'aportacion' && carSrc(m) === 'ahorros').map(m => ({
+    id: m.id, kind: 'retirada', amount: m.amount, date: m.date, created: m.created, note: m.note, carLink: true,
+  })));
 }
 /** Saldo = saldo inicial + movimientos desde la fecha del saldo inicial (hasta `upTo`, si se indica). */
 function fundBalance(fund, upTo) {
   const f = FUNDS[fund], acc = f.store();
   if (acc.start == null) return null;
-  return acc.start + acc.movements
+  return acc.start + f.movs()
     .filter(m => m.date >= acc.startDate && (!upTo || m.date <= upTo))
     .reduce((t, m) => t + f.kinds[m.kind].sign * m.amount, 0);
 }
 const carBalance = () => fundBalance('car');
 function savStats(prefix) {
-  const ms = S.savings.movements.filter(inPeriod(prefix)), g = k => sum(ms.filter(m => m.kind === k));
+  const ms = savMovs().filter(inPeriod(prefix)), g = k => sum(ms.filter(m => m.kind === k));
   const dep = g('deposito'), ret = g('retirada');
   return { dep, ret, net: dep - ret };
 }
@@ -361,6 +394,13 @@ const stat = (label, value, cls = '') => `<div class="stat ${cls}"><div class="l
 const empty = t => `<p class="empty">${t}</p>`;
 
 function rowMov(m) {
+  if (m.sav) {
+    return `<button class="row" data-act="editsav" data-id="${m.id}">
+      <i style="background:var(--accent)"></i>
+      <div class="rt"><div class="rn">Pasado a ahorros</div>
+        <div class="rs">${shortDate(m.date)}${m.note ? ' · ' + esc(m.note) : ''}</div></div>
+      <div class="ra">−${eur(m.amount)}</div></button>`;
+  }
   const inc = m.type === 'ingreso';
   const info = catInfo(m.type, m.category), sub = m.sub ? subName(m.type, m.category, m.sub) : '';
   const name = (inc ? 'Ingreso · ' : '') + info.name + (sub ? ' · ' + sub : '');
@@ -373,25 +413,28 @@ function rowMov(m) {
 
 function rowCar(m) {
   const k = CAR_KINDS[m.kind];
+  const from = m.kind === 'aportacion' ? ' · ' + SOURCES.aportacion[carSrc(m)].name.toLowerCase() : '';
   return `<button class="row" data-act="editcar" data-id="${m.id}">
     <i style="background:${m.kind === 'gasolina' ? PALETTE[2] : 'var(--pos)'}"></i>
-    <div class="rt"><div class="rn">${k.icon} ${k.name}</div>
+    <div class="rt"><div class="rn">${k.icon} ${k.name}${from}</div>
       <div class="rs">${shortDate(m.date)}${m.note ? ' · ' + esc(m.note) : ''}</div></div>
     <div class="ra ${k.sign > 0 ? 'pos' : ''}">${k.sign > 0 ? '+' : '−'}${eur(m.amount)}</div></button>`;
 }
 
 function rowSav(m) {
   const k = SAV_KINDS[m.kind];
-  return `<button class="row" data-act="editsav" data-id="${m.id}">
+  const name = m.carLink ? 'Pasado a la hucha del coche' : k.sign < 0 ? 'Sacado de ahorros'
+    : savSrc(m) === 'nomina' ? 'Metido desde la nómina' : 'Metido en ahorros';
+  return `<button class="row" data-act="${m.carLink ? 'editcar' : 'editsav'}" data-id="${m.id}">
     <i style="background:${k.sign > 0 ? 'var(--pos)' : 'var(--accent)'}"></i>
-    <div class="rt"><div class="rn">${k.sign > 0 ? 'Metido en ahorros' : 'Sacado de ahorros'}</div>
+    <div class="rt"><div class="rn">${name}</div>
       <div class="rs">${shortDate(m.date)}${m.note ? ' · ' + esc(m.note) : ''}</div></div>
     <div class="ra ${k.sign > 0 ? 'pos' : ''}">${k.sign > 0 ? '+' : '−'}${eur(m.amount)}</div></button>`;
 }
 
 function viewMonth() {
-  const mk = ui.month, exp = expenses(mk), inc = incomes(mk);
-  const tE = sum(exp), tI = sum(inc), left = tI - tE;
+  const mk = ui.month, exp = expenses(mk), inc = incomes(mk), sav = toSavings(mk);
+  const tE = sum(exp), tI = sum(inc), tS = sum(sav), left = tI - tE - tS;
   const byCat = {};
   exp.forEach(m => { byCat[m.category] = (byCat[m.category] || 0) + m.amount; });
   const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1])
@@ -405,7 +448,7 @@ function viewMonth() {
       <div class="bud-sub ${over ? 'bad' : ''}">${over ? '⚠ Te has pasado ' + eur(spent - b) : 'Te quedan ' + eur(b - spent)}</div></div>`;
   }).join('');
 
-  let list = exp.concat(inc).sort(byDateDesc);
+  let list = exp.concat(inc, sav).sort(byDateDesc);
   if (ui.filterCat) list = list.filter(m => m.type === 'gasto' && m.category === ui.filterCat);
 
   // Desglose por tipo cuando se filtra una categoría que los tiene (Luz, Agua… o Cuota, Taller…).
@@ -422,6 +465,7 @@ function viewMonth() {
     <ol><li>Pulsa el botón Compartir de Safari</li><li>Elige «Añadir a pantalla de inicio»</li><li>Abre Finanzas desde el icono nuevo</li></ol></div>` : ''}
   ${periodNav(monthLabel(mk), periodSub(mk))}
   <div class="stats">${stat('Ingresos', eur(tI))}${stat('Gastos', eur(tE))}${stat('Te queda', eur(left), left < 0 ? 'neg' : 'hl')}</div>
+  ${tS ? `<p class="note">Has pasado ${eur(tS)} a ahorros este mes. Ya está restado de lo que te queda y sumado a tu cuenta de ahorros.</p>` : ''}
   <section class="card"><h2>Gastos por categoría</h2>
     ${cats.length ? `${donut(cats, tE)}<div class="legend">${cats.map(c => `
       <button class="leg ${ui.filterCat === c.id ? 'on' : ''}" data-act="filter" data-id="${c.id}">
@@ -506,8 +550,9 @@ function viewCar() {
       <div class="sub">${bal < 0 ? 'Falta dinero en la cuenta: añade una aportación' : 'Debería coincidir con lo que tienes en esa cuenta'}</div></div>
     <div class="car-btns">${Object.entries(CAR_KINDS).map(([k, v]) => `<button data-act="addcar" data-kind="${k}"><span>${v.icon}</span>${v.name}</button>`).join('')}</div>
     ${periodNav(monthLabel(mk), periodSub(mk))}
-    <div class="stats">${stat('Gasolina', eur(st.gas))}${stat('BlaBlaCar', eur(st.bla))}${st.net > 0 ? stat('Te costó', eur(st.net), 'neg') : stat('Te sobró', eur(-st.net), 'hl')}</div>
-    ${st.apo ? `<p class="note">Este mes metiste ${eur(st.apo)} de tu dinero. Aparece como gasto de Transporte en tu resumen del mes.</p>` : ''}
+    <div class="stats">${stat('Gasolina', eur(st.gas))}${stat('BlaBlaCar', eur(st.bla))}${st.net > 0 ? stat('Te costó', eur(st.net), 'neg') : stat('Te sobró', eur(-st.net || 0), 'hl')}</div>
+    ${st.apoNom ? `<p class="note">Este mes metiste ${eur(st.apoNom)} de tu nómina. Aparece como gasto de Transporte en tu resumen del mes.</p>` : ''}
+    ${st.apoSav ? `<p class="note">Este mes pasaste ${eur(st.apoSav)} desde tus ahorros. Se ha restado de tu cuenta de ahorros.</p>` : ''}
     <section class="card"><h2>Coste neto por mes · ${y}</h2>
       ${barChart({
         labels: MES_C.map(m => m[0].toUpperCase()), series: [{ name: 'Coste neto', color: PALETTE[2], values: yearly.map(s => s.net) }], height: 140,
@@ -532,7 +577,7 @@ function viewSavings() {
       <label class="field"><span>A fecha de</span><input id="sav-date" type="date" value="${today()}"></label>
       <button class="primary" data-act="savsetup">Empezar</button>
     </section>
-    <p class="hint">Después podrás meter dinero o sacarlo (por ejemplo, si compras algo con los ahorros). Nada de esto cuenta en los gastos o ingresos del mes.</p>`;
+    <p class="hint">Después podrás meter dinero o sacarlo (por ejemplo, si compras algo con los ahorros). Lo que pases desde la nómina se resta de lo que te queda del mes.</p>`;
   }
   const bal = fundBalance('sav'), mk = ui.savMonth, st = savStats(mk), y = mk.slice(0, 4), now = today();
   const startMonth = periodOf(S.savings.startDate), nowMonth = curMonth();
@@ -542,7 +587,7 @@ function viewSavings() {
     if (m < startMonth || m > nowMonth) return null;
     return fundBalance('sav', m === nowMonth ? now : periodRange(m).to);
   });
-  const ys = savStats(y), list = S.savings.movements.filter(inPeriod(mk)).sort(byDateDesc);
+  const ys = savStats(y), list = savMovs().filter(inPeriod(mk)).sort(byDateDesc);
   return `<div class="hero"><div class="lbl">Saldo de tu cuenta de ahorros</div>
       <div class="big ${bal < 0 ? 'neg' : ''}">${eur(bal)}</div>
       <div class="sub">Debería coincidir con lo que tienes en esa cuenta</div></div>
@@ -626,8 +671,8 @@ function openFundForm(fund, id, kind) {
   const m = id && FUNDS[fund].store().movements.find(x => x.id === id);
   const month = fund === 'car' ? ui.carMonth : ui.savMonth;
   ui.form = m
-    ? { kind: fund, id: m.id, created: m.created, fk: m.kind, amount: amountText(m.amount), date: m.date, note: m.note || '' }
-    : { kind: fund, fk: kind || Object.keys(FUNDS[fund].kinds)[0], amount: '', date: month === curMonth() ? today() : periodRange(month).from, note: '' };
+    ? { kind: fund, id: m.id, created: m.created, fk: m.kind, src: fund === 'car' ? carSrc(m) : savSrc(m), amount: amountText(m.amount), date: m.date, note: m.note || '' }
+    : { kind: fund, fk: kind || Object.keys(FUNDS[fund].kinds)[0], src: 'nomina', amount: '', date: month === curMonth() ? today() : periodRange(month).from, note: '' };
   renderSheet(!m);
 }
 
@@ -643,16 +688,22 @@ function renderSheet(focus) {
   const f = ui.form;
   let body;
   if (f.kind === 'mov') {
-    body = `<div class="seg">${['gasto', 'ingreso'].map(t => `<button data-act="ftype" data-v="${t}" class="${f.type === t ? 'on' : ''}">${t === 'gasto' ? 'Gasto' : 'Ingreso'}</button>`).join('')}</div>
+    const types = [['gasto', 'Gasto'], ['ingreso', 'Ingreso'], ['ahorro', 'A ahorros']];
+    body = `<div class="seg">${types.map(([t, l]) => `<button data-act="ftype" data-v="${t}" class="${f.type === t ? 'on' : ''}">${l}</button>`).join('')}</div>
+      ${f.type === 'ahorro' ? `<p class="kind-help">Dinero que pasas de la nómina a tu cuenta de ahorros. Se resta de lo que te queda este mes y se suma solo a Ahorros.</p>
+      <input id="f-amount" class="amount" inputmode="decimal" placeholder="0,00 €" autocomplete="off" value="${esc(f.amount)}">` : `
       <input id="f-amount" class="amount" inputmode="decimal" placeholder="0,00 €" autocomplete="off" value="${esc(f.amount)}">
       <div class="chips">${catList(f.type).map(c => `<button class="chip ${f.category === c.id ? 'on' : ''}" data-act="fcat" data-id="${c.id}">${esc(c.name)}</button>`).join('')}</div>
       ${subList(f.type, f.category).length ? `<p class="sub-label">¿De qué es?</p>
         <div class="chips sub">${subList(f.type, f.category).map(s => `<button class="chip ${f.sub === s.id ? 'on' : ''}" data-act="fsub" data-id="${s.id}">${esc(s.name)}</button>`).join('')}</div>` : ''}
-      ${f.type === 'gasto' && (f.category === 'transporte' || f.category === 'coche') ? '<p class="note">¿Es gasolina? Apúntala en la pestaña Coche para que salga de la hucha y no de tus gastos.</p>' : ''}`;
+      ${f.type === 'gasto' && (f.category === 'transporte' || f.category === 'coche') ? '<p class="note">¿Es gasolina? Apúntala en la pestaña Coche para que salga de la hucha y no de tus gastos.</p>' : ''}`}`;
   } else {
     const kinds = FUNDS[f.kind].kinds;
     body = `<div class="seg">${Object.entries(kinds).map(([k, v]) => `<button data-act="fkind" data-v="${k}" class="${f.fk === k ? 'on' : ''}">${v.icon} ${v.name}</button>`).join('')}</div>
       <p class="kind-help">${kinds[f.fk].help}</p>
+      ${SOURCES[f.fk] ? `<p class="sub-label">¿De dónde sale el dinero?</p>
+        <div class="seg">${Object.entries(SOURCES[f.fk]).map(([k, v]) => `<button data-act="fsrc" data-v="${k}" class="${f.src === k ? 'on' : ''}">${v.name}</button>`).join('')}</div>
+        <p class="kind-help">${SOURCES[f.fk][f.src].help}</p>` : ''}
       <input id="f-amount" class="amount" inputmode="decimal" placeholder="0,00 €" autocomplete="off" value="${esc(f.amount)}">`;
   }
   const title = f.kind === 'mov' ? (f.id ? 'Editar movimiento' : 'Nuevo movimiento') : (f.id ? 'Editar · ' : '') + FUNDS[f.kind].title;
@@ -683,13 +734,18 @@ function saveForm() {
   if (!(amount > 0)) return toast('Escribe una cantidad válida');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(f.date)) return toast('Elige una fecha');
   const base = { id: f.id || uid(), amount, date: f.date, note: f.note.trim(), created: f.created || Date.now() };
-  if (f.kind === 'mov') {
+  if (f.kind === 'mov' && f.type === 'ahorro') {
+    if (S.savings.start == null) return toast('Primero crea tu cuenta en la pestaña Ahorros');
+    S.savings.movements.push(Object.assign(base, { kind: 'deposito', src: 'nomina' }));
+  } else if (f.kind === 'mov') {
     if (!f.category) return toast('Elige una categoría');
     const subs = subList(f.type, f.category);
     if (subs.length && !subs.some(s => s.id === f.sub)) return toast('Elige de qué es el gasto (' + subs.map(s => s.name).slice(0, 3).join(', ') + '…)');
     upsert(S.movements, Object.assign(base, { type: f.type, category: f.category }, subs.length ? { sub: f.sub } : {}));
   } else {
-    upsert(FUNDS[f.kind].store().movements, Object.assign(base, { kind: f.fk }));
+    if (SOURCES[f.fk] && !SOURCES[f.fk][f.src]) f.src = Object.keys(SOURCES[f.fk])[0];
+    if (f.fk === 'aportacion' && f.src === 'ahorros' && S.savings.start == null) return toast('Primero crea tu cuenta en la pestaña Ahorros');
+    upsert(FUNDS[f.kind].store().movements, Object.assign(base, { kind: f.fk }, SOURCES[f.fk] ? { src: f.src } : {}));
   }
   persist();
   const shown = ui.tab === 'coche' ? ui.carMonth : ui.tab === 'ahorros' ? ui.savMonth : ui.month;
@@ -805,7 +861,8 @@ const ACTIONS = {
   ftype: el => { readForm(); ui.form.type = el.dataset.v; ui.form.category = null; renderSheet(); },
   fcat: el => { readForm(); if (ui.form.category !== el.dataset.id) ui.form.sub = null; ui.form.category = el.dataset.id; renderSheet(); },
   fsub: el => { readForm(); ui.form.sub = el.dataset.id; renderSheet(); },
-  fkind: el => { readForm(); ui.form.fk = el.dataset.v; renderSheet(); },
+  fkind: el => { readForm(); ui.form.fk = el.dataset.v; if (SOURCES[ui.form.fk] && !SOURCES[ui.form.fk][ui.form.src]) ui.form.src = 'nomina'; renderSheet(); },
+  fsrc: el => { readForm(); ui.form.src = el.dataset.v; renderSheet(); },
   fsave: saveForm,
   fdelete: deleteForm,
   close: closeSheet,

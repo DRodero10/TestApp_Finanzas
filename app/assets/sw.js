@@ -1,7 +1,7 @@
 'use strict';
 // Lets the iPhone version open without connection. Network first, so a new version arrives as soon as there is
 // connection; the cached copy is used when offline. The data is not here: it lives in the phone's localStorage.
-const CACHE = 'finanzas-v4';
+const CACHE = 'finanzas-v5';
 const FILES = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest', './icon-180.png', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
